@@ -1,6 +1,6 @@
 <!--
 ================================================================================
-  fortigate-ar.conf  —  Wazuh Manager ossec.conf snippets
+  ossec-conf-snippet.xml  —  Wazuh Manager ossec.conf snippets
   Add these blocks inside the <ossec_config> element of:
     /var/ossec/etc/ossec.conf
 

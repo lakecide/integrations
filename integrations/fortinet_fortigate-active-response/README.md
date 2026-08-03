@@ -102,6 +102,7 @@ sudo chown root:wazuh /var/ossec/etc/fortigate-ar.conf
 sudo chmod 640        /var/ossec/etc/fortigate-ar.conf
 
 # 3. Whitelist
+# The whitelist is not shipped in this repo - it is created empty at install time
 sudo install -o root -g wazuh -m 640 /dev/null \
         /var/ossec/etc/lists/fortigate-ar-whitelist
 # Add one IP per line to exempt trusted sources (scanners, jump hosts, etc.)
@@ -123,7 +124,7 @@ FGT_VDOM="root"                       # VDOM name (root if not using VDOMs)
 ```
 
 All available options are documented in
-[`active-response/fortigate-ar.conf`](active-response/fortigate-ar.conf).
+[`active-response/fortigate-ar.conf.example`](active-response/fortigate-ar.conf.example).
 
 ### Add to `/var/ossec/etc/ossec.conf`
 
@@ -144,11 +145,11 @@ All available options are documented in
 </active-response>
 ```
 
-`<location>server</location>` is required — the script runs on the Manager because it needs to reach the FortiGate API. See [`active-response/fortigate-ar.conf`](active-response/fortigate-ar.conf) for more trigger examples.
+`<location>server</location>` is required — the script runs on the Manager because it needs to reach the FortiGate API. See [`active-response/ossec-conf-snippet.xml`](active-response/ossec-conf-snippet.xml) for more trigger examples.
 
 ### Whitelist your infrastructure
 
-Edit `/var/ossec/etc/lists/fortigate-ar-whitelist` — one IP per line. Loopback addresses are always exempt regardless of this file.
+Edit `/var/ossec/etc/lists/fortigate-ar-whitelist` — one IP per line. This file is created empty at install time. RFC1918 private ranges, loopback, and link-local addresses are always exempt regardless of its contents.
 
 ### Restart Wazuh Manager
 
@@ -162,10 +163,10 @@ sudo systemctl restart wazuh-manager
 
 ```bash
 # Dry-run — prints the JSON without calling the API
-sudo bash integrations/fortinet_fortigate-active-response/tests/test-ar.sh block 198.51.100.99 dry
+sudo bash integrations/fortinet_fortigate/tests/test-ar.sh block 198.51.100.99 dry
 
 # Live block test
-sudo bash integrations/fortinet_fortigate-active-response/tests/test-ar.sh block 198.51.100.99
+sudo bash integrations/fortinet_fortigate/tests/test-ar.sh block 198.51.100.99
 
 # Verify on FortiGate
 curl -sk -H "Authorization: Bearer YOUR_TOKEN" \
@@ -173,7 +174,7 @@ curl -sk -H "Authorization: Bearer YOUR_TOKEN" \
   | jq '.results[0].member[].name'
 
 # Live unblock test
-sudo bash integrations/fortinet_fortigate-active-response/tests/test-ar.sh unblock 198.51.100.99
+sudo bash integrations/fortinet_fortigate/tests/test-ar.sh unblock 198.51.100.99
 
 # Monitor the AR log
 sudo tail -f /var/ossec/logs/active-responses.log
@@ -181,18 +182,36 @@ sudo tail -f /var/ossec/logs/active-responses.log
 
 ---
 
+
+---
+
+## Example run
+
+A live block triggered by rule 5760 (SSH authentication failure) from `81.177.135.56`:
+
+![Active response log showing address object creation and group membership](screenshots/active-response-block-log.png)
+
+The resulting `/32` address objects on the FortiGate, filtered by the `wazuh-` prefix:
+
+![FortiGate address objects created by the active response](screenshots/fortigate-blocked-addresses.png)
+
+Each object is referenced once (`Ref. 1`) — by the block group — and is removed automatically when the configured `<timeout>` expires.
+
+---
+
 ## Repository structure
 
 ```
 integrations/
-└── fortinet_fortigate-active-response/
+└── fortinet_fortigate/
     ├── active-response/
     │   ├── fortigate-block.sh              - AR script - /var/ossec/active-response/bin/
     │   ├── fortigate-ar.conf.example       - config template - /var/ossec/etc/
-    │   ├── fortigate-ar-whitelist          - whitelist template
-    │   └── fortigate-ar.conf               - ossec.conf snippets
+    │   └── ossec-conf-snippet.xml          - ossec.conf command + AR blocks
+	├── screenshots/                        - example run evidence
     ├── tests/
-    │   └── test-ar.sh                      - manual test 
+    │   └── test-ar.sh                      - manual test   
+    │   
     └── README.md
 ```
 
@@ -213,7 +232,7 @@ integrations/
 
 ## Security considerations
 
-- **Protect the API token** — `fortigate-ar.conf` is `root:wazuh 640`. Do not commit the live file; it is in `.gitignore`.
+- **Protect the API token** — the deployed `/var/ossec/etc/fortigate-ar.conf` is `root:wazuh 640`. Only `fortigate-ar.conf.example` (no secrets) is tracked in this repo; the live filename is excluded by `.gitignore`.
 - **Least-privilege API profile** — scope the FortiGate REST API admin to only Address and Address Group objects, not `super_admin`.
 - **Restrict Trusted Hosts** — only the Wazuh Manager IP should be listed in the FortiGate API admin's Trusted Hosts.
 - **use timeouts** — set `<timeout>` in ossec.conf so blocks automatically expire. Permanent blocks (`timeout=0`) require manual cleanup (optional).

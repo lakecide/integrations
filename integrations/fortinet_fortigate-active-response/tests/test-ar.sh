@@ -8,7 +8,14 @@
 #   bash tests/test-ar.sh block   <IP> dry   # print JSON only, no API calls
 #
 # Must be run as root on the Wazuh Manager with fortigate-ar.conf configured.
-
+#
+# PROTOCOL SIMULATED
+# ------------------
+# add    : execd writes the alert, reads the script's check_keys reply, then
+#          writes "continue". Two lines are fed to the script.
+# delete : execd writes the alert and closes the pipe. It never reads or
+#          replies, so only ONE line is fed. This mirrors the real deferred
+#          timeout invocation and is what makes the unblock path testable.
 # =============================================================================
 set -euo pipefail
 
@@ -81,20 +88,32 @@ fi
 # ---------------------------------------------------------------------------
 # Live run — pre-feed approach (see header comment for explanation)
 # ---------------------------------------------------------------------------
-echo "--- Feeding input to script ---"
-echo "  Line 1 → alert JSON  (command=${AR_CMD}, srcip=${TEST_IP})"
-echo "  Line 2 → continue    (sent after script writes check_keys)"
-echo ""
-
-# Record current log line count so we only show new output from this run
 LOG_START=$(wc -l < "${AR_LOG}" 2>/dev/null || echo 0)
 
 EXIT_CODE=0
-if printf '%s\n%s\n' "${ALERT_JSON}" "${CONTINUE_MSG}" \
-       | bash "${SCRIPT_PATH}" > /dev/null; then
-    EXIT_CODE=0
+if [[ "${AR_CMD}" == "add" ]]; then
+    # execd performs the check_keys handshake on add: feed alert + continue
+    echo "--- Feeding input to script (add: 2 lines) ---"
+    echo "  Line 1 -> alert JSON  (command=add, srcip=${TEST_IP})"
+    echo "  Line 2 -> continue    (execd reply after check_keys)"
+    echo ""
+    if printf '%s\n%s\n' "${ALERT_JSON}" "${CONTINUE_MSG}" \
+           | bash "${SCRIPT_PATH}" > /dev/null; then
+        EXIT_CODE=0
+    else
+        EXIT_CODE=$?
+    fi
 else
-    EXIT_CODE=$?
+    # execd does NOT handshake on the deferred delete: feed the alert only
+    echo "--- Feeding input to script (delete: 1 line, no handshake) ---"
+    echo "  Line 1 -> alert JSON  (command=delete, srcip=${TEST_IP})"
+    echo ""
+    if printf '%s\n' "${ALERT_JSON}" \
+           | bash "${SCRIPT_PATH}" > /dev/null; then
+        EXIT_CODE=0
+    else
+        EXIT_CODE=$?
+    fi
 fi
 
 echo "--- Script exited with code: ${EXIT_CODE} ---"

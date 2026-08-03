@@ -3,7 +3,7 @@
 # fortigate-block.sh
 # Wazuh Active Response — Fortinet FortiGate IP Block/Unblock via REST API
 #
-# Version  : 2.1.0
+# Version  : 2.2.0
 # Tested on: FortiOS 7.4.x, Wazuh Manager 4.14
 # Requires : bash 4+, curl, jq
 #
@@ -33,7 +33,7 @@
 # =============================================================================
 
 readonly SCRIPT_NAME="fortigate-block"
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.2.0"
 readonly AR_LOG="/var/ossec/logs/active-responses.log"
 readonly CONFIG_FILE="/var/ossec/etc/fortigate-ar.conf"
 
@@ -173,15 +173,28 @@ log "INFO" "Command=${AR_COMMAND} | IP=${SRCIP} | Rule=${RULE_ID} | Agent=${AGEN
 # ---------------------------------------------------------------------------
 # 5. Validate IPv4 format
 # ---------------------------------------------------------------------------
+# Validates dotted-quad format and normalises each octet to base 10.
+# The 10# prefix is required: bash treats a leading-zero literal as octal, so
+# an octet like "08" from a log (e.g. 172.08.1.1) would otherwise abort the
+# script with "value too great for base". Normalising also prevents pushing a
+# non-canonical address such as 010.0.0.1 to the FortiGate, where it could be
+# interpreted differently than intended.
+# On success, sets NORMALIZED_IP to the canonical dotted-quad form.
 ip_is_valid() {
     local ip="$1" IFS='.' octets
     read -r -a octets <<< "${ip}"
     [[ ${#octets[@]} -eq 4 ]] || return 1
-    local o
+
+    local o dec normalised=""
     for o in "${octets[@]}"; do
-        [[ "${o}" =~ ^[0-9]+$ ]] || return 1
-        (( o >= 0 && o <= 255 ))  || return 1
+        [[ "${o}" =~ ^[0-9]{1,3}$ ]] || return 1
+        dec=$((10#${o}))
+        (( dec >= 0 && dec <= 255 )) || return 1
+        normalised+="${dec}."
     done
+
+    NORMALIZED_IP="${normalised%.}"
+    return 0
 }
 
 if ! ip_is_valid "${SRCIP}"; then
@@ -189,18 +202,29 @@ if ! ip_is_valid "${SRCIP}"; then
     exit 1
 fi
 
+# Use the canonical form from here on (object names, subnet, whitelist checks)
+if [[ "${NORMALIZED_IP}" != "${SRCIP}" ]]; then
+    log "INFO" "Normalised source IP '${SRCIP}' to '${NORMALIZED_IP}'"
+    SRCIP="${NORMALIZED_IP}"
+fi
+
 # ---------------------------------------------------------------------------
 # 6. Whitelist check
 # ---------------------------------------------------------------------------
 is_whitelisted() {
     local ip="$1"
-    local first="${ip%%.*}"
-    local second; second="${ip#*.}"; second="${second%%.*}"
-    [[ "${ip}" == 127.*       ]] && return 0
-    [[ "${ip}" == 169.254.*   ]] && return 0
-    (( first == 10 ))            && return 0
-    (( first == 172 && second >= 16 && second <= 31 )) && return 0
-    [[ "${ip}" == 192.168.*   ]] && return 0
+    # 10# forces base-10; without it an octet like "08" is parsed as invalid
+    # octal and aborts the script. Input is already normalised by ip_is_valid,
+    # but the prefix is kept so the function is safe if reused elsewhere.
+    local first=$((10#${ip%%.*}))
+    local second_raw="${ip#*.}"; second_raw="${second_raw%%.*}"
+    local second=$((10#${second_raw}))
+
+    (( first == 127 ))           && return 0   # loopback
+    (( first == 169 && second == 254 )) && return 0   # link-local
+    (( first == 10 ))            && return 0   # RFC1918
+    (( first == 172 && second >= 16 && second <= 31 )) && return 0   # RFC1918
+    (( first == 192 && second == 168 )) && return 0   # RFC1918
     if [[ -f "${LOCAL_WHITELIST_FILE}" ]]; then
         while IFS= read -r line; do
             [[ "${line}" =~ ^[[:space:]]*# ]] && continue
@@ -217,35 +241,82 @@ if is_whitelisted "${SRCIP}"; then
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Wazuh execd stateful handshake (deduplication)
-#    Script writes check_keys - reads "continue" or "abort"
+# 7. Derive the FortiGate address object name (needed by both add and delete)
 # ---------------------------------------------------------------------------
 ADDR_NAME="${FGT_ADDR_PREFIX}$(echo "${SRCIP}" | tr '.' '-')"
 
-CONTROL_MSG=$(jq -cn \
-    --arg name "${SCRIPT_NAME}" \
-    --arg key  "${SRCIP}" \
-    '{version:1,origin:{name:$name,module:"active-response"},
-      command:"check_keys",parameters:{keys:[$key]}}')
-echo "${CONTROL_MSG}"
-log "DEBUG" "Sent check_keys for key=${SRCIP}"
+# ---------------------------------------------------------------------------
+# 7a. Wazuh execd stateful handshake — PERFORMED ON "add" ONLY
+#
+#     wazuh-execd runs the check_keys / continue-abort exchange only on the
+#     initial "add" invocation, where it binds both stdin and stdout and waits
+#     for the script's reply before adding the entry to its timeout list.
+#
+#     For the deferred "delete" invocation fired when the AR <timeout> expires,
+#     execd writes the alert to stdin and closes the pipe — it never reads or
+#     replies. Running the handshake there blocks until the 30s read timeout,
+#     exits down the error path, and never reaches group_remove_member, so
+#     blocked IPs are never cleaned up from the FortiGate.
+#
+#     This mirrors the upstream Wazuh active-response helpers, which call the
+#     handshake only when the command is ADD_COMMAND.
+#
+#     Returns: 0 = proceed, 1 = abort (duplicate in flight), 2 = protocol error
+# ---------------------------------------------------------------------------
+execd_handshake() {
+    local control_msg execd_response execd_cmd
 
-if ! read -r -t 30 EXECD_RESPONSE; then
-    log "ERROR" "Timed out waiting for execd response."
-    exit 1
-fi
+    control_msg=$(jq -cn \
+        --arg name "${SCRIPT_NAME}" \
+        --arg key  "${SRCIP}" \
+        '{version:1,origin:{name:$name,module:"active-response"},
+          command:"check_keys",parameters:{keys:[$key]}}')
 
-EXECD_CMD=$(echo "${EXECD_RESPONSE}" | jq -r '.command // empty')
-if [[ "${EXECD_CMD}" != "continue" ]]; then
-    log "INFO" "execd responded '${EXECD_CMD}' — skipping (likely duplicate in-flight block)."
-    exit 0
-fi
+    echo "${control_msg}"
+    log "DEBUG" "Sent check_keys for key=${SRCIP}"
+
+    if ! read -r -t 30 execd_response; then
+        log "ERROR" "Timed out waiting for execd handshake response."
+        return 2
+    fi
+
+    execd_cmd=$(echo "${execd_response}" | jq -r '.command // empty')
+    if [[ "${execd_cmd}" != "continue" ]]; then
+        log "INFO" "execd responded '${execd_cmd}' — skipping (duplicate in-flight block)."
+        return 1
+    fi
+
+    return 0
+}
 
 # ---------------------------------------------------------------------------
 # 8. FortiGate API helper
-#    Returns the response body; logs request + HTTP status; returns 1 on error
+#
+#    Every HTTP status is surfaced to the caller, not just 5xx: a 4xx with a
+#    non-JSON body (an auth proxy's HTML 403 page, for example) is logged with
+#    its status code rather than collapsing into a generic failure.
+#
+#    OUTPUT PROTOCOL: the first line of stdout is the HTTP status code, the
+#    remainder is the response body. Callers use api_http / api_body to split.
+#    A status code cannot be returned via the exit status (codes above 255
+#    wrap) and cannot be passed in a global (callers invoke this via command
+#    substitution, which runs in a subshell), so it travels in-band.
+#
+#    Exit status: 0 = HTTP response received (any code), 1 = curl transport
+#    failure (DNS, TLS, connection refused, timeout).
 # ---------------------------------------------------------------------------
 VDOM_PARAM="vdom=${FGT_VDOM}"
+
+api_http() { printf '%s' "${1%%$'\n'*}"; }
+
+# Command substitution strips trailing newlines, so a response with an empty
+# body arrives as just the status code with no separator. Guard against that,
+# otherwise the status code would be returned as if it were the body.
+api_body() {
+    local r="$1"
+    [[ "${r}" == *$'\n'* ]] || return 0
+    printf '%s' "${r#*$'\n'}"
+}
 
 fgt_api() {
     local method="$1" endpoint="$2" data="${3:-}"
@@ -267,34 +338,48 @@ fgt_api() {
     raw=$("${cmd[@]}" 2>&1); exit_code=$?
 
     if (( exit_code != 0 )); then
-        log "ERROR" "curl failed (exit ${exit_code}) ${method} ${endpoint}: ${raw}"
+        log "ERROR" "curl transport failure (exit ${exit_code}) on ${method} ${endpoint}: ${raw}"
+        printf '000\n'
         return 1
     fi
 
     local body="${raw%__STATUS__*}"
     local http="${raw##*__STATUS__}"
-    log "DEBUG" "API response HTTP=${http}: ${body}"
+    body="${body%$'\n'}"          # drop the newline injected by -w
+    http="${http//[^0-9]/}"
+    [[ -z "${http}" ]] && http="000"
 
-    if (( http >= 500 )); then
-        log "ERROR" "FortiGate HTTP ${http} on ${method} ${endpoint} — body: ${body}"
-        return 1
+    log "DEBUG" "API ${method} ${endpoint} -> HTTP ${http}: ${body}"
+
+    if (( http >= 400 )); then
+        local api_err api_msg
+        api_err=$(echo "${body}" | jq -r '.error                 // empty' 2>/dev/null)
+        api_msg=$(echo "${body}" | jq -r '.cli_error // .message // empty' 2>/dev/null)
+        if [[ -n "${api_err}" || -n "${api_msg}" ]]; then
+            log "ERROR" "FortiGate HTTP ${http} on ${method} ${endpoint}${api_err:+ (error ${api_err})}${api_msg:+ — ${api_msg}}"
+        else
+            # Non-JSON body — log it verbatim so the cause is not hidden
+            log "ERROR" "FortiGate HTTP ${http} on ${method} ${endpoint} — non-JSON body: ${body}"
+        fi
     fi
 
-    echo "${body}"
+    printf '%s\n%s' "${http}" "${body}"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
 # 9. Address object helpers
 # ---------------------------------------------------------------------------
 addr_exists() {
-    local name="$1"
-    local resp; resp=$(fgt_api "GET" "firewall/address/${name}") || return 1
-    [[ "$(echo "${resp}" | jq -r '.status // empty')" == "success" ]]
+    local name="$1" resp http
+    resp=$(fgt_api "GET" "firewall/address/${name}") || return 1
+    http=$(api_http "${resp}")
+    [[ "${http}" == "200" ]]
 }
 
 create_addr_object() {
     local name="$1" ip="$2"
-    # Truncate comment to 255 chars (FortiGate limit)
+    # FortiGate truncates comments at 255 chars
     local comment="${FGT_ADDR_COMMENT} | Rule:${RULE_ID} | ${RULE_DESC}"
     comment="${comment:0:255}"
 
@@ -304,32 +389,48 @@ create_addr_object() {
         '{name:$n,type:"ipmask",subnet:$s,comment:$c,color:6}')
 
     log "INFO" "Creating address object '${name}' for ${ip}/32"
-    local resp; resp=$(fgt_api "POST" "firewall/address" "${payload}") || return 1
-    local status; status=$(echo "${resp}" | jq -r '.status // empty')
 
-    if [[ "${status}" == "success" ]]; then
-        log "INFO" "Address object '${name}' created successfully."
+    local resp http body status
+    resp=$(fgt_api "POST" "firewall/address" "${payload}") || return 1
+    http=$(api_http "${resp}")
+    body=$(api_body "${resp}")
+    status=$(echo "${body}" | jq -r '.status // empty' 2>/dev/null)
+
+    if [[ "${http}" == "200" && "${status}" == "success" ]]; then
+        log "INFO" "Address object '${name}' created."
         return 0
     fi
-    # 409-equivalent: object already exists — safe to continue
+
+    # FortiGate answers HTTP 500 with error -5 when the object already exists,
+    # so a failed POST is not conclusive — probe before giving up.
     if addr_exists "${name}"; then
-        log "WARN" "Address object '${name}' already exists — proceeding."
+        log "WARN" "Address object '${name}' already exists — reusing it."
         return 0
     fi
-    log "ERROR" "Failed to create address object '${name}': ${resp}"
+
+    log "ERROR" "Could not create address object '${name}' (HTTP ${http}): ${body}"
     return 1
 }
 
 delete_addr_object() {
-    local name="$1"
+    local name="$1" resp http body status
     log "INFO" "Deleting address object '${name}'"
-    local resp; resp=$(fgt_api "DELETE" "firewall/address/${name}") || return 1
-    local status; status=$(echo "${resp}" | jq -r '.status // empty')
-    if [[ "${status}" == "success" ]]; then
+
+    resp=$(fgt_api "DELETE" "firewall/address/${name}") || return 1
+    http=$(api_http "${resp}")
+    body=$(api_body "${resp}")
+    status=$(echo "${body}" | jq -r '.status // empty' 2>/dev/null)
+
+    if [[ "${http}" == "200" && "${status}" == "success" ]]; then
         log "INFO" "Address object '${name}' deleted."
-    else
-        log "WARN" "Could not delete '${name}' (may still be referenced): ${resp}"
+        return 0
     fi
+    if [[ "${http}" == "404" ]]; then
+        log "INFO" "Address object '${name}' already absent — nothing to delete."
+        return 0
+    fi
+    log "WARN" "Could not delete '${name}' (HTTP ${http}, may still be referenced): ${body}"
+    return 0   # non-fatal: the IP is already out of the block group
 }
 
 # ---------------------------------------------------------------------------
@@ -342,28 +443,47 @@ delete_addr_object() {
 group_add_member() {
     local group="$1" addr_name="$2"
     local payload; payload=$(jq -cn --arg n "${addr_name}" '{"name":$n}')
+
     log "INFO" "Adding '${addr_name}' to group '${group}'"
-    local resp; resp=$(fgt_api "POST" "firewall/addrgrp/${group}/member" "${payload}") || return 1
-    local status; status=$(echo "${resp}" | jq -r '.status // empty')
-    if [[ "${status}" == "success" ]]; then
-        log "INFO" "Successfully added '${addr_name}' to group '${group}'."
+
+    local resp http body status
+    resp=$(fgt_api "POST" "firewall/addrgrp/${group}/member" "${payload}") || return 1
+    http=$(api_http "${resp}")
+    body=$(api_body "${resp}")
+    status=$(echo "${body}" | jq -r '.status // empty' 2>/dev/null)
+
+    if [[ "${http}" == "200" && "${status}" == "success" ]]; then
+        log "INFO" "Added '${addr_name}' to group '${group}'."
         return 0
     fi
-    log "ERROR" "Failed to add '${addr_name}' to group '${group}': ${resp}"
+    if [[ "${http}" == "404" ]]; then
+        log "ERROR" "Group '${group}' does not exist on the FortiGate — create it first."
+        return 1
+    fi
+    log "ERROR" "Could not add '${addr_name}' to group '${group}' (HTTP ${http}): ${body}"
     return 1
 }
 
 group_remove_member() {
     local group="$1" addr_name="$2"
     log "INFO" "Removing '${addr_name}' from group '${group}'"
-    local resp; resp=$(fgt_api "DELETE" "firewall/addrgrp/${group}/member/${addr_name}") || return 1
-    local status; status=$(echo "${resp}" | jq -r '.status // empty')
-    if [[ "${status}" == "success" ]]; then
+
+    local resp http body status
+    resp=$(fgt_api "DELETE" "firewall/addrgrp/${group}/member/${addr_name}") || return 1
+    http=$(api_http "${resp}")
+    body=$(api_body "${resp}")
+    status=$(echo "${body}" | jq -r '.status // empty' 2>/dev/null)
+
+    if [[ "${http}" == "200" && "${status}" == "success" ]]; then
         log "INFO" "Removed '${addr_name}' from group '${group}'."
-    else
-        log "WARN" "Could not remove '${addr_name}' from group (may not be a member): ${resp}"
+        return 0
     fi
-    return 0   # non-fatal — group membership may have already been cleaned
+    if [[ "${http}" == "404" ]]; then
+        log "INFO" "'${addr_name}' is not a member of '${group}' — nothing to remove."
+        return 0
+    fi
+    log "WARN" "Could not remove '${addr_name}' from group '${group}' (HTTP ${http}): ${body}"
+    return 0   # non-fatal — continue to the address object cleanup
 }
 
 # ---------------------------------------------------------------------------
@@ -371,6 +491,13 @@ group_remove_member() {
 # ---------------------------------------------------------------------------
 case "${AR_COMMAND}" in
     add)
+        # Handshake first — execd only speaks the check_keys protocol on "add"
+        execd_handshake
+        case $? in
+            1) exit 0 ;;   # duplicate in flight — nothing to do
+            2) exit 1 ;;   # protocol error
+        esac
+
         log "INFO" "=== BLOCK action for ${SRCIP} ==="
         create_addr_object "${ADDR_NAME}" "${SRCIP}" || exit 1
         group_add_member   "${FGT_BLOCK_GROUP}" "${ADDR_NAME}" || exit 1
@@ -378,6 +505,8 @@ case "${AR_COMMAND}" in
         ;;
 
     delete)
+        # No handshake here — execd does not read or reply on the deferred
+        # timeout invocation. Attempting it would stall and leave the IP blocked.
         log "INFO" "=== UNBLOCK action for ${SRCIP} ==="
         group_remove_member "${FGT_BLOCK_GROUP}" "${ADDR_NAME}"
         [[ "${FGT_CLEANUP_ADDR}" == "true" ]] && delete_addr_object "${ADDR_NAME}"
